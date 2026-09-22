@@ -8,7 +8,6 @@ from scipy.special import factorial, roots_legendre, eval_legendre
 from scipy import signal
 from scipy.interpolate import interp1d, CubicSpline,splrep, BSpline
 from scipy.sparse import csr_matrix, csc_matrix
-from scipy.special import logsumexp
 from IPython.display import display, Latex, Markdown
 
 import csv
@@ -1396,44 +1395,19 @@ class multiple_dataset_simulation(BaseSimulation):
         self.nD = sum(sim.nD for sim in simulation_list)
         self.nM = sum(sim.nM for sim in simulation_list)
         nM_ind_first, nM_ind_last = 0, 0
-        self.nM_indices, self.nD_indices = [],[]
         for i, sim in enumerate(simulation_list):
-            self.nM_indices.append(np.arange(self.nM)[nM_ind_first:nM_ind_first+sim.nM])
-            self.nD_indices.append(np.arange(self.nD)[nM_ind_last:nM_ind_last+sim.nD])
+            sim.nM_indices = np.arange(self.nM)[nM_ind_first:nM_ind_first+sim.nM]
+            sim.nD_indices = np.arange(self.nD)[nM_ind_last:nM_ind_last+sim.nD]
             nM_ind_first += sim.nM
             nM_ind_last += sim.nD
 
     def dpred(self,m):
         assert len(m) == self.nM, "Model vector length does not match total number of model parameters"
-        dpred = np.zeros(self.nD)
-        for sim, nM_indices, nD_indices in zip(
-            self.simulation_list, self.nM_indices, self.nD_indices
-            ):
-            dpred[nD_indices] = sim.dpred(m[nM_indices])
-        return dpred
+        data_list = []
+        for sim in self.simulation_list:
 
-    def J(self, m):
-        assert len(m) == self.nM, "Model vector length does not match total number of model parameters"
-        J = np.zeros((self.nD, self.nM))
-        for sim, rows, cols in zip(
-            self.simulation_list, self.nD_indices, self.nM_indices
-            ):
-            
-            J[np.ix_(rows, cols)] = sim.J(m[cols])
-        return J
 
-    def project_convex_set(self, m):
-        assert len(m) == self.nM, "Model vector length does not match total number of model parameters"
-        m_projected = np.zeros(self.nM)
-        for sim, nM_indices, in zip(
-            self.simulation_list, self.nM_indices
-            ):
-            m_projected[nM_indices] = sim.project_convex_set(m[nM_indices])
-        return m_projected
 
-    def slice_model_vector(self,m, sim_index):
-        assert 0 <= sim_index < self.nSim, "Simulation index out of range"
-        return m[self.nM_indices[sim_index]]
 
 
 class Pelton_res_f(): 
@@ -3014,7 +2988,7 @@ class Optimization:  # Inherits from BaseSimulation
         # r = self.dpred(m)-self.dobs
         # r = self.Wd @ r
         r = self.Wd @(self.dpred(m)-self.dobs)
-        phid = 0.5*np.dot(r,r)
+        phid = np.dot(r,r)
         phim = 0
         if m_ref is not None:
             rms = self.Ws @ (m - m_ref)

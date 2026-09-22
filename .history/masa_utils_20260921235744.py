@@ -8,7 +8,6 @@ from scipy.special import factorial, roots_legendre, eval_legendre
 from scipy import signal
 from scipy.interpolate import interp1d, CubicSpline,splrep, BSpline
 from scipy.sparse import csr_matrix, csc_matrix
-from scipy.special import logsumexp
 from IPython.display import display, Latex, Markdown
 
 import csv
@@ -3014,7 +3013,7 @@ class Optimization:  # Inherits from BaseSimulation
         # r = self.dpred(m)-self.dobs
         # r = self.Wd @ r
         r = self.Wd @(self.dpred(m)-self.dobs)
-        phid = 0.5*np.dot(r,r)
+        phid = np.dot(r,r)
         phim = 0
         if m_ref is not None:
             rms = self.Ws @ (m - m_ref)
