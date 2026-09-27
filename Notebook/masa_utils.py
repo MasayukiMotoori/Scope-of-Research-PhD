@@ -214,9 +214,8 @@ class BaseSimulation:
 class empymod_IP_simulation(BaseSimulation):
     AVAILABLE_MODELS = ['pelton', 'Cole','DDR','DDC','DDR_MPA', 'DDC_MPA']
     def __init__(self, model_base, nlayer, tx_height, m_depth=False,
-        nD=0, nlayer_fix=0, Prj_m=None, m_fix=None,
+        nD=0,  Prj_m=None, m_fix=None,
         recw=None,resmin=1e-3 , resmax=1e6, chgmin=1e-3, chgmax=0.9,
-        # taumin=1e-6, taumax=1e-1, cmin= 0.4, cmax=0.9,
         taumin=1e-6, taumax=1e2, cmin= 0.2, cmax=0.9,
         taus=None, ip_model='pelton',
         smp_freq=None, times=None,filt_curr=None,  window_mat=None,
@@ -226,10 +225,15 @@ class empymod_IP_simulation(BaseSimulation):
         self.ip_model = ip_model
         self.model_base = model_base
         self.nlayer = int(nlayer)
-        self.nlayer_fix = int(nlayer_fix)
         self.m_depth = m_depth
         self.tx_height = tx_height
-        self.nP = 4*(nlayer + nlayer_fix)
+        self.taus = taus
+        self.ntau = len(self.taus) if taus is not None else 1
+        if self.ip_model in ['pelton', 'Cole']:
+            self.nP = 4*(self.nlayer)
+        elif self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA']:
+            self.nP = (self.ntau+1)*self.nlayer
+
         self.Prj_m = Prj_m  
         self.m_fix = m_fix
         self.recw = recw
@@ -241,12 +245,13 @@ class empymod_IP_simulation(BaseSimulation):
             self.nM = self.nP
             self.m_fix = np.zeros(self.nP) 
             self.nM_r = nlayer
-            self.nM_m = nlayer
-            self.nM_t = nlayer
-            self.nM_c = nlayer
-        self.taus = taus
-        self.ntau = len(taus) if taus is not None else None
-        # self.proj_a = np.ones(self.ntau) if taus is not None else None
+            if self.ip_model in ['pelton', 'Cole']:
+                self.nM_m = nlayer
+                self.nM_t = nlayer
+                self.nM_c = nlayer
+            elif self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA']:
+                self.nM_m = self.ntau*nlayer
+                self.nM_t, self.nM_c = 0, 0
         self.nD = nD
         self.resmin = resmin
         self.resmax = resmax
@@ -285,46 +290,35 @@ class empymod_IP_simulation(BaseSimulation):
         self.recw = recw
         self.model_base['rec'] = [recx, recy, tx_depth ,0,90]
 
-    def fix_sea_tau_c(self,
-             res_sea, chg_sea, tau_sea, c_sea):
-        ## return and set mapping for fixigin sea and basement resistivity
-        ## Assert there are no fix ing at this stage
-        nlayer = self.nlayer
-        nlayer_fix=1
-        nlayer_sum = nlayer+nlayer_fix
-        Prj_m_A = np.block([ # res chg
-            [np.zeros(nlayer)], # sea water
-            [np.eye(nlayer)], # layers
-        ])
-        Prj_m_b =np.block([ # tau c
-            [0], # sea water
-            [np.ones(nlayer).reshape(-1,1)], # layers
-        ])
-        Prj_m=np.block([
-        [Prj_m_A, np.zeros((nlayer_sum, nlayer+2))], # Resistivity
-        [np.zeros((nlayer_sum,  nlayer)), Prj_m_A, np.zeros((nlayer_sum, 2))], # Chargeability
-        [np.zeros((nlayer_sum,2*nlayer)), Prj_m_b, np.zeros(nlayer_sum).reshape(-1,1)], # Time constant
-        [np.zeros((nlayer_sum,2*nlayer)), np.zeros(nlayer_sum).reshape(-1,1), Prj_m_b], # Exponent C
-        ])
-        m_fix = np.r_[ 
-        np.log(res_sea), np.zeros(nlayer), # Resistivity
-        chg_sea, np.zeros(nlayer), # Chargeability
-        np.log(tau_sea),np.zeros(nlayer), # Time constant
-        c_sea,np.zeros(nlayer) # Exponent C
-        ]
-        assert len(m_fix) == 4*nlayer_sum
-        self.nlayer_fix = nlayer_fix
-        self.Prj_m = Prj_m
-        self.m_fix = m_fix
-        self.nP= Prj_m.shape[0]
-        self.nM= Prj_m.shape[1]
-        self.nM_r = nlayer
-        self.nM_m = nlayer
-        self.nM_t = 0
-        self.nM_c = 0
-        assert self.nP == 4*(nlayer_sum)
-        assert self.nM == 2*nlayer
-        return Prj_m, m_fix
+    def activate_etas(self, WdJ, threshold_ratio=1e-6):
+        """"
+        Return a boolean array indicating which etas should be activated given the sensitivity.
+        Sensitivity is assumed as uncertainty-weighted Jacobian matrix WdJ.
+        So we recomment to call this function after data uncertainty is computed.
+        J[:,0] is the sensitivity to rho0, and J[:,1:] is the sensitivity to etas.
+        1. Get the maximum and sigin of -rho0
+        2. The time windows after the after maximum -rho0 are examined
+        3. If the sensitivity of eta at any time window is larger than rho0 then this eta is activated.
+        4. The threshold_ratio is used to avoid activating etas with very small sensitivity compared to rho0.
+        """
+        assert self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA'], "activate_etas is only applicable for DD models"
+        assert WdJ.shape[1] == self.ntau +1, "The number of columns in WdJ should be equal to ntau + 1 (for rho0)"
+        if self.ip_model in ['DDR', 'DDR_MPA']:
+            con8 = -WdJ[:,0]
+        else:
+            con8 = WdJ[:,0]
+        ind_con8 = np.argmax(np.abs(con8)) # infulence and sing of con8 is the largest at this time window
+        sign_ip = -np.sign(con8[ind_con8]) # sing of IP is estimated as the opposite of the sign of con8 sensitivity
+        threshold = threshold_ratio * np.max(np.abs(con8))
+        boole_etas = np.full(self.ntau, False)
+        ind_max=con8.shape[0]-1
+        for k in range(self.ntau):
+            etak = WdJ[:, k+1]
+            ind_eta = np.argmax(sign_ip*etak)
+            if ind_eta > ind_con8 and ind_eta<ind_max:
+                if np.any ((etak[ind_con8:]+con8[ind_con8:]) *sign_ip > threshold):
+                    boole_etas[k] = True
+        return boole_etas
 
     def deepsea_three_layers_bottom_fixed(self, 
          res_sea, res_base, bool_etas=None,
@@ -423,117 +417,56 @@ class empymod_IP_simulation(BaseSimulation):
             self.nM_t, self.nM_c, self.nM_d = 0, 0, 0
             self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea
 
-    def deepsea_signle_layer(self, res_sea, res_base,
-         eta_sea=0,  tau_sea=1e-3, c_sea=0.4,
-         eta_base=0, tau_base=1e-3, c_base=0.4
-         ):
+    def dd_deepsea_fix_sea(self, res_sea, eta_sea=0):
         """
-        Three layrer model consits of signle target layer, Sea water and bottom layer.
-        The physical property of Sea water and bottom layer
-        For Pelton model
-        m[0] : resistivity of the layer
-        m[1] : chargeability of the layer
-        m[2] : time constant of the layer in log
-        m[3] : exponent C of the layer
-        For Debye Decompostion model
-        m[0] : resistivity of the layer
-        m[1:ntau+1] : chargeabilities of the layer
-        """
-        self.nlayer = 1
-        nlayer_fix = 2
-        # resistivity
-        if self.ip_model == 'pelton':
-            Prj_m_diag = np.diag(np.r_[
-                        0,1,0,  # resistivity 
-                        0,1,0, # chargeability
-                        0,1,0, # time constant
-                        0,1,0, # exponent C
-                        ])
-            non_zero_columns = ~np.all(Prj_m_diag == 0, axis=0)
-            Prj_m = Prj_m_diag[:, non_zero_columns]
-            m_fix = np.r_[np.log(res_sea),0,np.log(res_base), # resistivity
-                          eta_sea,   0, eta_base, # chargeability
-                        np.log(tau_sea), 0, np.log(tau_base),# time constant
-                        c_sea, 0, c_base,# exponent C
-                        ]
-            self.nlayer_fix = nlayer_fix
-            self.Prj_m = Prj_m
-            self.m_fix = m_fix
-            self.nP= Prj_m.shape[0]
-            self.nM= Prj_m.shape[1]
-            self.nM_r, self.nM_m  = 1,1
-            self.nM_t, self.nM_c, self.nM_d = 1,1 , 0
-            self.res_sea, self.con_sea = res_sea, 1/res_sea
-            self.eta_sea, self.tau_sea, self.c_sea = eta_sea, tau_sea, c_sea
-
-        if self.ip_model == 'Cole':
-            Prj_m_diag = np.diag(np.r_[
-                        0,1,0, # Conductivity 
-                        0,1,0, # chargeability
-                        0,1,0, # time constant
-                        0,1,0, # exponent C
-                        ])
-            non_zero_columns = ~np.all(Prj_m_diag == 0, axis=0)
-            Prj_m = Prj_m_diag[:, non_zero_columns]
-
-            m_fix = np.r_[-np.log(res_sea),0, -np.log(res_base), # Conductivity
-                        eta_sea, 0, eta_base, # chargeability
-                        np.log(tau_sea), 0, np.log(tau_base),# time constant
-                        c_sea, 0, c_base,# exponent C
-                        ]
-            self.nlayer_fix = nlayer_fix
-            self.Prj_m = Prj_m
-            self.m_fix = m_fix
-            self.nP= Prj_m.shape[0]
-            self.nM= Prj_m.shape[1]
-            self.nM_r, self.nM_m  = 1,1
-            self.nM_t, self.nM_c, self.nM_d = 1,1 , 0
-            self.res_sea, self.con_sea = res_sea, 1/res_sea
-            self.eta_sea, self.tau_sea, self.c_sea = eta_sea, tau_sea, c_sea
-
-        if self.ip_model == 'DDR' or self.ip_model == 'DDR_MPA':
-            pattern_eta = list(np.r_[0,1,0])
-            diag_etas = np.array(pattern_eta*self.ntau).flatten()
-            Prj_m_diag = np.diag(np.r_[
-                        0,1,0,  # resistivity
-                        diag_etas, # etas
-                        ])
-            non_zero_columns = ~np.all(Prj_m_diag == 0, axis=0)
-            Prj_m = Prj_m_diag[:, non_zero_columns]
-            m_fix_etas_pattern = list(np.r_[eta_sea, 0,eta_base])
-            m_fix_etas = np.array(m_fix_etas_pattern*self.ntau).flatten()
-            m_fix = np.r_[np.log(res_sea),0, np.log(res_base), # resistivity
-                        m_fix_etas, # etas
-                        ]
-            self.nlayer_fix = nlayer_fix
-            self.Prj_m = Prj_m
-            self.m_fix = m_fix
-            self.nP, self.nM = Prj_m.shape
-            self.nM_r, self.nlayer_m, self.nM_m= 1,1, self.ntau
-            self.nM_t, self.nM_c, self.nM_d = 0, 0, 0
-            self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea
+        First layer is sea water with fixed resistivity and chargeability
+        Seafloor is devided into nlayer-1 layers under deep sea
+        IP effect is described as Debye Decomposition model with ntau etas    
+        p[0:nlayer] : log of resistivity 
+        p[1*nlayer: 2*nlayer]: eta with 1st time constant 
+        p[2*nlayer: 3*nlayer]: eta with 2nd time constant
+        ::
+        p[(natu)*nlayer: (ntau+1)*nlayer] : eta with ntau-oreder time constant
+        """      
+        assert self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA'], "activate_etas is only applicable for DD models"
+        nP_layer = self.ntau +1
+        # set first layer as sea water with fixed resistivity and chargeability
+        bool_MtoP = np.r_[np.full(nP_layer,False), 
+                np.full(self.nP-nP_layer,True)]
+        diag_nP= np.diag(np.ones(self.nP))
+        Prj_m = diag_nP[:,bool_MtoP]
+        m_fix = np.r_[np.log(res_sea), eta_sea*np.ones(self.ntau), 
+                      np.zeros(self.nP-nP_layer)]
+        self.Prj_m = Prj_m
+        self.m_fix = m_fix
+        self.nM_r, self.nM_m= self.nlayer-1, self.ntau*(self.nlayer-1)
+        self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea 
  
-        if self.ip_model == 'DDC':
-            pattern_eta = list(np.r_[0,1,0])
-            diag_etas = np.array(pattern_eta*self.ntau).flatten()
-            Prj_m_diag = np.diag(np.r_[
-                        0, 1, 0,  # Conductivity
-                        diag_etas, # etas
-                        ])
-            non_zero_columns = ~np.all(Prj_m_diag == 0, axis=0)
-            Prj_m = Prj_m_diag[:, non_zero_columns]
-            m_fix_etas_pattern = list(np.r_[eta_sea,0,eta_base])
-            m_fix_etas = np.array(m_fix_etas_pattern*self.ntau).flatten()
-            m_fix = np.r_[-np.log(res_sea),0, -np.log(res_base), # Conudctivity
-                        m_fix_etas, # etas
-                        ]
-            self.nlayer_fix = nlayer_fix
-            self.Prj_m = Prj_m
-            self.m_fix = m_fix
-            self.nP, self.nM = Prj_m.shape
-            self.nM_r, self.nlayer_m, self.nM_m= 1,1, self.ntau
-            self.nM_t, self.nM_c, self.nM_d = 0, 0, 0
-            self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea
+    def dd_deactivate_etas(self, Wd, m_ref=None, eta_fix=0):
+        # deactivate etas for each layer using sensitivity analysis
+        # Assuming the first layer is sea water with fixed resistivity and chargeability
+        assert self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA'], "activate_etas is only applicable for DD models"
+        nP_layer = self.ntau +1
+        bool_MtoP = np.r_[np.full(nP_layer,False), 
+                np.full(self.nP-nP_layer,True)]        
+        if m_ref is None:
+            m_ref = np.r_[np.log(self.res_sea)*np.ones(self.nlayer-1),
+                                  self.eta_sea*np.ones((self.nlayer-1)*self.ntau)] 
+        WdJ = Wd @ self.dpred(m_ref)
+        for i in range(1,self.nlayer):
+            ind_start = i*nP_layer
+            ind_end = (i+1)*nP_layer
+            bool_etas = self.activate_etas(WdJ[:,ind_start:ind_end])
+            bool_MtoP[ind_start+1:ind_end] = bool_etas
+        diag_nP= np.diag(np.ones(self.nP))
+        Prj_m = diag_nP[:,bool_MtoP]
+
+        m_fix_sea = self.m_fix[:nP_layer]
+        self.m_fix[np.logical_not(bool_MtoP)] = eta_fix
+        self.m_fix[:nP_layer] = m_fix_sea
+        self.Prj_m = Prj_m
+        self.nM_m= bool_MtoP.sum()-(self.nlayer-1)
+
 
     def deepsea_two_layer(self, res_sea,
          eta_sea=0,  tau_sea=1e-3, c_sea=0.4,
@@ -660,47 +593,6 @@ class empymod_IP_simulation(BaseSimulation):
             self.nM_t, self.nM_c, self.nM_d = 0, 0, self.nlayer-1
             self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea
 
-    def fix_sea_one_tau_c(self,
-             res_sea, chg_sea, tau_sea, c_sea):
-        ## return and set mapping for fixigin sea and basement resistivity
-        ## Assert there are no fix ing at this stage
-        nlayer = self.nlayer
-        nlayer_fix=1
-        nlayer_sum = nlayer+nlayer_fix
-        Prj_m_A = np.block([ # res chg
-            [np.zeros(nlayer)], # sea water
-            [np.eye(nlayer)], # layers
-        ])
-        Prj_m_b =np.block([ # tau c
-            [0], # sea water
-            [np.ones(nlayer).reshape(-1,1)], # layers
-        ])
-        Prj_m=np.block([
-        [Prj_m_A, np.zeros((nlayer_sum, nlayer+2))], # Resistivity
-        [np.zeros((nlayer_sum,  nlayer)), Prj_m_A, np.zeros((nlayer_sum, 2))], # Chargeability
-        [np.zeros((nlayer_sum,2*nlayer)), Prj_m_b, np.zeros(nlayer_sum).reshape(-1,1)], # Time constant
-        [np.zeros((nlayer_sum,2*nlayer)), np.zeros(nlayer_sum).reshape(-1,1), Prj_m_b], # Exponent C
-        ])
-        m_fix = np.r_[ 
-        np.log(res_sea), np.zeros(nlayer), # Resistivity
-        chg_sea, np.zeros(nlayer), # Chargeability
-        np.log(tau_sea),np.zeros(nlayer), # Time constant
-        c_sea,np.zeros(nlayer) # Exponent C
-        ]
-        assert len(m_fix) == 4*nlayer_sum
-        self.nlayer_fix = nlayer_fix
-        self.Prj_m = Prj_m
-        self.m_fix = m_fix
-        self.nP= Prj_m.shape[0]
-        self.nM= Prj_m.shape[1]
-        self.nM_r = nlayer
-        self.nM_m = nlayer
-        self.nM_t = 1
-        self.nM_c = 1
-        assert self.nP == 4*(nlayer_sum)
-        assert self.nM == 2*nlayer + 2
-        return Prj_m, m_fix
-
     def fix_sea(self, res_sea, chg_sea, tau_sea, c_sea):
         ## return and set mapping for fixigin sea and basement resistivity
         ## Assert there are no fix ing at this stage
@@ -773,6 +665,9 @@ class empymod_IP_simulation(BaseSimulation):
             self.nM_m, self.nM_t, self.nM_c, self.nM_d = 0,0,0,0
             self.res_sea, self.con_sea = res_sea, 1/res_sea
             self.eta_sea, self.tau_sea, self.c_sea = eta_sea, tau_sea, c_sea
+
+
+
 
     def pelton_et_al(self, inp, p_dict):
         """ 
@@ -1255,35 +1150,7 @@ class empymod_IP_simulation(BaseSimulation):
 
         return np.vstack(J).T
 
-    def activate_etas(self, WdJ, threshold_ratio=1e-6):
-        """"
-        Return a boolean array indicating which etas should be activated given the sensitivity.
-        Sensitivity is assumed as uncertainty-weighted Jacobian matrix WdJ.
-        So we recomment to call this function after data uncertainty is computed.
-        J[:,0] is the sensitivity to rho0, and J[:,1:] is the sensitivity to etas.
-        1. Get the maximum and sigin of -rho0
-        2. The time windows after the after maximum -rho0 are examined
-        3. If the sensitivity of eta at any time window is larger than rho0 then this eta is activated.
-        4. The threshold_ratio is used to avoid activating etas with very small sensitivity compared to rho0.
-        """
-        assert self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA'], "activate_etas is only applicable for DD models"
-        assert WdJ.shape[1] == self.ntau +1, "The number of columns in WdJ should be equal to ntau + 1 (for rho0)"
-        if self.ip_model in ['DDR', 'DDR_MPA']:
-            con8 = -WdJ[:,0]
-        else:
-            con8 = WdJ[:,0]
-        ind_con8 = np.argmax(np.abs(con8)) # infulence and sing of con8 is the largest at this time window
-        sign_ip = -np.sign(con8[ind_con8]) # sing of IP is estimated as the opposite of the sign of con8 sensitivity
-        threshold = threshold_ratio * np.max(np.abs(con8))
-        boole_etas = np.full(self.ntau, False)
-        ind_max=con8.shape[0]-1
-        for k in range(self.ntau):
-            etak = WdJ[:, k+1]
-            ind_eta = np.argmax(sign_ip*etak)
-            if ind_eta > ind_con8 and ind_eta<ind_max:
-                if np.any ((etak[ind_con8:]+con8[ind_con8:]) *sign_ip > threshold):
-                    boole_etas[k] = True
-        return boole_etas
+
 
     def J_prd(self,J):
         """"
