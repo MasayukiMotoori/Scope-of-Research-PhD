@@ -3169,7 +3169,7 @@ class Optimization:  # Inherits from BaseSimulation
             self.data_prg.append(dpred_old)
  
             # beta = beta0 / (coolingFactor ** (i // coolingRate))
-            f, phid, phim, dpred_old, g, H = self.loss_func_L2(
+            f_old, phid, phim, dpred_old, g, H = self.loss_func_L2(
                 mvec_old, beta, m_ref=m_ref, gradient=True,
                 update_Wsen=update_Wsen
                 )
