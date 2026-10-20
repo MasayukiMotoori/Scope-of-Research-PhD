@@ -417,56 +417,104 @@ class empymod_IP_simulation(BaseSimulation):
             self.nM_t, self.nM_c, self.nM_d = 0, 0, 0
             self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea
 
-    def dd_deepsea_fix_sea(self, res_sea, eta_sea=0):
+    def deepsea_fix_sea(self, res_sea, con_sea=None, eta_sea=0, tau_sea=None, c_sea=None):
         """
         First layer is sea water with fixed resistivity and chargeability
         Seafloor is devided into nlayer-1 layers under deep sea
-        IP effect is described as Debye Decomposition model with ntau etas    
-        p[0:nlayer] : log of resistivity 
-        p[1*nlayer: 2*nlayer]: eta with 1st time constant 
-        p[2*nlayer: 3*nlayer]: eta with 2nd time constant
-        ::
-        p[(natu)*nlayer: (ntau+1)*nlayer] : eta with ntau-oreder time constant
-        """      
-        assert self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA'], "activate_etas is only applicable for DD models"
-        nP_layer = self.ntau +1
-        # set first layer as sea water with fixed resistivity and chargeability
-        bool_MtoP = np.r_[np.full(nP_layer,False), 
-                np.full(self.nP-nP_layer,True)]
-        diag_nP= np.diag(np.ones(self.nP))
-        Prj_m = diag_nP[:,bool_MtoP]
-        m_fix = np.r_[np.log(res_sea), eta_sea*np.ones(self.ntau), 
-                      np.zeros(self.nP-nP_layer)]
-        self.Prj_m = Prj_m
-        self.m_fix = m_fix
-        self.nM_r, self.nM_m= self.nlayer-1, self.ntau*(self.nlayer-1)
-        self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea 
- 
-    def dd_deactivate_etas(self, Wd, m_ref=None, eta_fix=0):
+        
+        for Cole-Cole or Pelton model
+        #p[0:nlayer] : log of resistivity or log of conductivity
+        #p[1*nlayer: 2*nlayer]: chargeability  
+        #p[2*nlayer: 3*nlayer]: log of time constant
+        #p[3*nlayer: 4*nlayer] : Cole-Cole exponent C
+        
+        for Debye Decomposition model
+        p[0:nlayer]: log of resistivity or log of conductivity
+        p[i*nlayer:(i+1)*nlayer]: chargeability with i-th time constant  
+        """  
+        self.nlayer_fix = 0    
+        if self.ip_model in ['pelton', 'Cole']:
+
+            nP_layer = 4 # each layer has 4 parameters
+            # Fix sea
+            bool_MtoP=([False] + [True] * (self.nlayer-1)) * 4
+            diag_nP= np.diag(np.ones(self.nP))
+            Prj_m = diag_nP[:,bool_MtoP]
+            m_fix = np.r_[np.log(res_sea), np.zeros(self.nlayer-1), # resistivity
+                                  eta_sea, np.zeros(self.nlayer-1), # chargeability
+                          np.log(tau_sea), np.zeros(self.nlayer-1), # time constant
+                                    c_sea, np.zeros(self.nlayer-1)]
+            assert m_fix.size == self.nP, "Size of m_fix does not match nP"
+            self.Prj_m, self.m_fix = Prj_m, m_fix
+            self.nM_r, self.nM_m= self.nlayer-1, self.nlayer-1
+            self.nM_t, self.nM_c= self.nlayer-1, self.nlayer-1
+            self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea        
+
+        elif self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA']:
+            
+            nP_layer = self.ntau +1
+            # set first layer as sea water with fixed resistivity and chargeability
+            bool_MtoP= np.tile([False] + [True] * (self.nlayer-1), nP_layer)
+            diag_nP= np.diag(np.ones(self.nP))
+            Prj_m = diag_nP[:,bool_MtoP]
+            m_fix = np.r_[
+                            np.log(res_sea),
+                            np.zeros(self.nlayer - 1),  # resistivity
+                            np.tile(
+                                np.r_[eta_sea, np.zeros(self.nlayer - 1)],
+                                self.ntau
+                            )
+                        ]
+            assert m_fix.size == self.nP, "Size of m_fix does not match nP"
+            p_meta_list = []
+            for j in range(self.ntau+1):
+                for i in range(self.nlayer):
+                    if j==0:
+                        p_meta_list.append(["rho_0",i]) # rho0, ith layer
+                    else:
+                        p_meta_list.append([f"m_{j}",i]) # eta_j, ith layer
+            # set the projection matrix for rho0 and sum of etas for each layer
+            Prj_RM = np.zeros((2*self.nlayer, (1+self.ntau)*self.nlayer))
+            Prj_RM [:self.nlayer, :self.nlayer] = np.eye(self.nlayer)
+            for i in range(self.nlayer):
+                Prj_RM[self.nlayer+i, self.nlayer+i::self.nlayer] = 1.0
+
+            self.p_meta_list, self.Prj_RM = p_meta_list, Prj_RM
+            self.Prj_m, self.m_fix = Prj_m, m_fix
+            self.nM_r, self.nM_m= self.nlayer-1, self.ntau*(self.nlayer-1)
+            self.res_sea, self.con_sea, self.eta_sea, = res_sea, 1/res_sea, eta_sea 
+
+    def dd_deactivate_etas(self, WdJ):
         # deactivate etas for each layer using sensitivity analysis
         # Assuming the first layer is sea water with fixed resistivity and chargeability
+
         assert self.ip_model in ['DDR', 'DDR_MPA', 'DDC', 'DDC_MPA'], "activate_etas is only applicable for DD models"
-        nP_layer = self.ntau +1
-        bool_MtoP = np.r_[np.full(nP_layer,False), 
-                np.full(self.nP-nP_layer,True)]        
-        if m_ref is None:
-            m_ref = np.r_[np.log(self.res_sea)*np.ones(self.nlayer-1),
-                                  self.eta_sea*np.ones((self.nlayer-1)*self.ntau)] 
-        WdJ = Wd @ self.dpred(m_ref)
-        for i in range(1,self.nlayer):
-            ind_start = i*nP_layer
-            ind_end = (i+1)*nP_layer
-            bool_etas = self.activate_etas(WdJ[:,ind_start:ind_end])
-            bool_MtoP[ind_start+1:ind_end] = bool_etas
+        nP_layer = self.ntau + 1
+        nlayer_m = self.nlayer - 1
+        assert WdJ.shape[1] == (nP_layer) * (nlayer_m)
+
+        self.m_meta_list = []
+        self.bool_etas_cmb = []
+        self.indices_m_list = []
+        bool_MtoP = np.r_[np.full(self.nP,False)] 
+        for i in range(nlayer_m):
+            WdJ_layer = WdJ[:, i::self.nlayer-1]
+            bool_etas= self.activate_etas(WdJ=WdJ_layer)
+            self.bool_etas_cmb.append(bool_etas)
+            bool_MtoP_layer = np.r_[True, bool_etas] 
+            bool_MtoP[1+i::self.nlayer] = bool_MtoP_layer
+        
+        for i, meta in enumerate(self.p_meta_list):
+            if bool_MtoP[i]:
+                self.m_meta_list.append(meta)
+        m_meta = np.array(self.m_meta_list, dtype=object)
+        for i in range(nlayer_m):
+            self.indices_m_list.append(np.where(m_meta[:,1]==i+1)[0])
         diag_nP= np.diag(np.ones(self.nP))
-        Prj_m = diag_nP[:,bool_MtoP]
-
-        m_fix_sea = self.m_fix[:nP_layer]
-        self.m_fix[np.logical_not(bool_MtoP)] = eta_fix
-        self.m_fix[:nP_layer] = m_fix_sea
-        self.Prj_m = Prj_m
-        self.nM_m= bool_MtoP.sum()-(self.nlayer-1)
-
+        self.Prj_m = diag_nP[:,bool_MtoP]
+        self.nM = self.Prj_m.shape[1]
+        self.nM_r = nlayer_m
+        self.nM_m= bool_MtoP.sum() - self.nM_r
 
     def deepsea_two_layer(self, res_sea,
          eta_sea=0,  tau_sea=1e-3, c_sea=0.4,
@@ -629,8 +677,6 @@ class empymod_IP_simulation(BaseSimulation):
         assert self.nM == 4*nlayer
         return Prj_m, m_fix
 
-    # def noIP(self):
-
     def deepsea_noIP(self, res_sea,
         eta_sea=0,  tau_sea=1e-3,  c_sea=0.5,
         eta_base=0, tau_base=1e-3, c_base=0.5
@@ -665,9 +711,6 @@ class empymod_IP_simulation(BaseSimulation):
             self.nM_m, self.nM_t, self.nM_c, self.nM_d = 0,0,0,0
             self.res_sea, self.con_sea = res_sea, 1/res_sea
             self.eta_sea, self.tau_sea, self.c_sea = eta_sea, tau_sea, c_sea
-
-
-
 
     def pelton_et_al(self, inp, p_dict):
         """ 
@@ -1068,7 +1111,10 @@ class empymod_IP_simulation(BaseSimulation):
         return projected_x
     
     def project_convex_set(self, m):
-        return self.clip_model(m)
+        if self.ip_model in ['Cole', 'pelton']:
+            return self.clip_model(m)
+        if self.ip_model in ['DDR','DDR_MPA','DDC', 'DDC_MPA']:
+            return self.clip_model_dd(m)
 
     def proj_c(self,mvec):
         "Project model vector to convex set defined by bound information"
@@ -1107,17 +1153,7 @@ class empymod_IP_simulation(BaseSimulation):
         if self.nM_m > 0:
             mvec_tmp[ index_r: index_m]=np.clip(
                 mvec[ index_r: index_m], self.chgmin, self.chgmax
-                )
-            if self.ip_model in ['DDR','DDR_MPA','DDC', 'DDC_MPA']:
-                mvec_tmp[ index_r: index_m]= self.projection_halfspace(
-                mvec_tmp[ index_r: index_m], np.ones(self.nM_m), self.chgmax
-                )
-                # mvec_tmp[ index_r: index_m: self.nlayer_m]= self.projection_halfspace(
-                # mvec_tmp[ index_r: index_m: self.nlayer_m], self.proj_a, self.chgmax
-                # )
-                # mvec_tmp[ index_r: index_m: self.nlayer_m]= self.projection_halfspace(
-                # mvec_tmp[ index_r: index_m: self.nlayer_m],-self.proj_a, self.chgmin
-                # )            
+                )         
         if self.nM_t > 0:
             mvec_tmp[ index_m: index_t]=np.clip(
                 mvec[ index_m: index_t], np.log(self.taumin), np.log(self.taumax)
@@ -1128,6 +1164,31 @@ class empymod_IP_simulation(BaseSimulation):
                 )
         return mvec_tmp
     
+    def clip_model_dd(self, mvec, eta_tol=1e-3, maxiter=20):
+        mvec_tmp = mvec.copy()
+        # nlayer = self.nlayer
+        for indices_m in self.indices_m_list:
+            mvec_tmp[indices_m[0]] = np.clip(
+                mvec[indices_m[0]], np.log(self.resmin), np.log(self.resmax)
+                )
+            if indices_m.size > 1:
+                mvec_tmp[indices_m[1:]] = np.clip(
+                    mvec[indices_m[1:]], self.chgmin, self.chgmax
+                    )
+
+            if indices_m.size > 2:
+                for i in range(maxiter):
+                    mvec_tmp[indices_m[1:]] = self.projection_halfspace(
+                    mvec_tmp[indices_m[1:]], np.ones(indices_m.size-1),self.chgmax
+                    )
+                    mvec_tmp[indices_m[1:]] = np.clip(
+                    mvec_tmp[indices_m[1:]], self.chgmin, self.chgmax
+                    )
+                    # print( np.dot(mvec_tmp[indices_m[1:]], np.ones(indices_m.size-1)) )
+                    if np.dot(mvec_tmp[indices_m[1:]], np.ones(indices_m.size-1)) -self.chgmax <=  eta_tol:
+                        break
+        return mvec_tmp
+
     def J(self, model_vector):
         return self.Japprox(model_vector)
 
@@ -1149,8 +1210,6 @@ class empymod_IP_simulation(BaseSimulation):
             J.append((pos - neg) / (2. * delta_m))
 
         return np.vstack(J).T
-
-
 
     def J_prd(self,J):
         """"
@@ -1301,8 +1360,7 @@ class multiple_dataset_simulation(BaseSimulation):
     def slice_model_vector(self,m, sim_index):
         assert 0 <= sim_index < self.nSim, "Simulation index out of range"
         return m[self.nM_indices[sim_index]]
-
-
+    
 class Pelton_res_f(): 
     def __init__(self, freq=None, con=False,
                  reslim= np.r_[1e-2,1e5],
@@ -2726,13 +2784,12 @@ class Optimization:  # Inherits from BaseSimulation
         self.Wd =np.diag(1 / std.flatten())
     
     def get_Ws(self, smallness):
-        # if self.sim.nM is not None:
-        #     self.Ws = np.eye(self.sim.nM)
-        # else:
         self.smallness= smallness
         self.Ws = np.diag(smallness)
 
     def update_Ws(self, J):
+        # update smallness weight matrix based on Sensitiviity
+        assert self.Ws_threshold is not None, "Ws_threshold must be set before updating Ws"
         if self.Wd is None:
             Sensitivity = np.sqrt(np.sum(J**2, axis=0))
         else:
@@ -2802,8 +2859,10 @@ class Optimization:  # Inherits from BaseSimulation
         self.Wx = Wx
         return Wx
 
-    def get_Wx_r(self):
+    def get_Wx_r(self,deepsea=False):
         nlayer = self.sim.nlayer
+        if deepsea:
+            nlayer= self.sim.nlayer-1
         if nlayer == 1:
             print("No smoothness for one layer model")
             nM = self.nM
@@ -2826,6 +2885,26 @@ class Optimization:  # Inherits from BaseSimulation
         self.Wx = Wx
         return Wx
 
+    def get_Wx_dd(self,rho0_eta_ratio=1.0):
+        nlayer = self.sim.nlayer
+        assert nlayer > 1, "No smoothness for one layer model"
+        assert self.sim.Prj_RM is not None, "Prj_RM must be set before calling get_Wx_dd"
+        assert self.sim.Prj_m is not None, "Prj_m must be set before"
+        depth = self.sim.model_base["depth"]
+        depth_ext= np.r_[depth[0]-(depth[1]-depth[0]),depth, 2*depth[-1]-depth[-2]]
+        x = (depth_ext[:-1] + depth_ext[1:]) / 2
+        delta_x = np.diff(x)
+        elm1 = 1/delta_x
+        elm2 = np.sqrt(delta_x)
+        elm2[0] = 0.0
+        Wx_p_block = np.zeros((nlayer-1, nlayer))
+        Wx_p_block[:,:-1] = -np.diag(elm2*elm1)
+        Wx_p_block[:,1:] += np.diag(elm2*elm1)
+        Wx_p = np.zeros((2*(nlayer-1),2*nlayer))
+        Wx_p[:nlayer-1,:nlayer] = Wx_p_block
+        Wx_p[nlayer-1:,nlayer:] = rho0_eta_ratio*Wx_p_block
+        self.Wx = Wx_p@self.sim.Prj_RM@self.sim.Prj_m
+    
     def get_Wx_rm(self):
         nlayer = self.sim.nlayer
         nM_r = self.sim.nM_r
@@ -2890,44 +2969,6 @@ class Optimization:  # Inherits from BaseSimulation
             rmx = self.Wx @ m
             phim += 0.5 * self.alphax*np.dot(rmx, rmx)
         return phid+beta*phim, phid, phim
-    
-    def loss_func_L2(self,m, beta, gradient=False,update_Wsen=False,m_ref=None):
-        if gradient:
-            J = self.J(m)
-            if update_Wsen:
-                self.update_Ws(J)
-            dpred_m = self.dpred(m)            
-            rd = self.Wd @ (dpred_m -self.dobs)
-            phid = 0.5 * np.dot(rd,rd)
-            g = J.T @ self.Wd.T@ rd
-            H = J.T @ self.Wd.T@ self.Wd@J
-            phim = 0
-            if m_ref is not None:
-                rms = self.Ws @ (m - m_ref)
-                phim += 0.5 * self.alphas*np.dot(rms, rms)
-                g += beta * self.alphas * (self.Ws.T@self.Ws@ (m - m_ref))
-                H += beta * self.alphas * self.Ws.T@self.Ws
-            if self.Wx is not None:
-                rmx = self.Wx @ m
-                phim += 0.5 * self.alphax*np.dot(rmx, rmx)
-                g += beta * self.alphax * (
-                    self.Wx.T @ self.Wx @ m)
-                H += beta * self.alphax * self.Wx.T @ self.Wx
-            f= phid+beta*phim
-            return f, phid, phim, dpred_m, g, H
-        else:
-            dpred_m = self.dpred(m)            
-            rd = self.Wd @ (dpred_m-self.dobs)
-            phid = 0.5 * np.dot(rd,rd)
-            phim = 0
-            if m_ref is not None:
-                rms = self.Ws @ (m - m_ref)
-                phim += 0.5 * self.alphas*np.dot(rms, rms)
-            if self.Wx is not None:
-                rmx = self.Wx @ m
-                phim += 0.5 * self.alphax*np.dot(rmx, rmx)
-            f= phid+beta*phim
-            return f, phid, phim, dpred_m
 
     def BetaEstimate_byEig(self,mvec, beta0_ratio=1.0, update_Wsen=False):
         J = self.J(mvec)
@@ -2957,6 +2998,12 @@ class Optimization:  # Inherits from BaseSimulation
         lambda_r = np.min(eig_reg)
         return beta0_ratio * lambda_d / lambda_r
 
+    def set_beta_schedule(self, niter, beta0, coolingRate=2, coolingFactor=2):
+        betas_list = []
+        for i in range(niter):
+            betas_list.append(beta0 / (coolingRate ** (i // coolingFactor)))
+        self.niter, self.betas_list = niter, betas_list
+    
     def steepest_descent(self, dobs, model_init, niter):
         '''
         Eldad Haber, EOSC555, 2023, UBC-EOAS 
@@ -3061,41 +3108,71 @@ class Optimization:  # Inherits from BaseSimulation
         # Save Jacobian
         self.Jacobian = J
         return mvec_new, error_prg, mvec_prg
-
-    def GaussNewton(self,mvec_init, niter, beta0, print_update=True, 
-        coolingFactor=2.0, coolingRate=2, s0=1.0, sfac=0.5,update_Wsen=False,
+    
+    def loss_func_L2(self,m, beta, gradient=False,update_Wsen=False,m_ref=None):
+        if gradient:
+            J = self.J(m)
+            if update_Wsen:
+                self.update_Ws(J)
+            dpred_m = self.dpred(m)            
+            rd = self.Wd @ (dpred_m -self.dobs)
+            phid = 0.5 * np.dot(rd,rd)
+            g = J.T @ self.Wd.T@ rd
+            H = J.T @ self.Wd.T@ self.Wd@J
+            phim = 0
+            if m_ref is not None:
+                rms = self.Ws @ (m - m_ref)
+                phim += 0.5 * self.alphas*np.dot(rms, rms)
+                g += beta * self.alphas * (self.Ws.T@self.Ws@ (m - m_ref))
+                H += beta * self.alphas * self.Ws.T@self.Ws
+            if self.Wx is not None:
+                rmx = self.Wx @ m
+                phim += 0.5 * self.alphax*np.dot(rmx, rmx)
+                g += beta * self.alphax * (
+                    self.Wx.T @ self.Wx @ m)
+                H += beta * self.alphax * self.Wx.T @ self.Wx
+            f= phid+beta*phim
+            return f, phid, phim, dpred_m, g, H
+        else:
+            dpred_m = self.dpred(m)            
+            rd = self.Wd @ (dpred_m-self.dobs)
+            phid = 0.5 * np.dot(rd,rd)
+            phim = 0
+            if m_ref is not None:
+                rms = self.Ws @ (m - m_ref)
+                phim += 0.5 * self.alphas*np.dot(rms, rms)
+            if self.Wx is not None:
+                rmx = self.Wx @ m
+                phim += 0.5 * self.alphax*np.dot(rmx, rmx)
+            f= phid+beta*phim
+            return f, phid, phim, dpred_m
+        
+    def GaussNewton(self, mvec_init, print_update=True, 
+        s0=1.0, sfac=0.5,update_Wsen=False,
         stol=1e-6, gtol=1e-3, mu=1e-4):
         self.error_prg = []
         self.data_prg = []
         self.mvec_prg = []
-        self.betas = []
+        # self.betas = []
 
         mvec_old = mvec_init.copy()
         m_ref = mvec_init
-        beta= beta0
-        f_old, phid, phim = self.loss_func(mvec_old,beta, m_ref=m_ref)# phid
+        beta= self.betas_list[0]
+        f_old, phid, phim, dpred_old = self.loss_func_L2(mvec_old,beta, m_ref=m_ref)# phid
 
-        for i in range(niter):
-            dpred_old = self.dpred(mvec_old)
-            self.betas.append(beta)
+        for i in range(self.niter):
+            beta = self.betas_list[i]
+            # dpred_old = self.dpred(mvec_old)
+            # self.betas.append(beta)
             self.error_prg.append([f_old, phid, phim])
             self.mvec_prg.append(mvec_old)
             self.data_prg.append(dpred_old)
-
-            beta = beta0 / (coolingFactor ** (i // coolingRate))
-            rd = self.Wd@(dpred_old - self.dobs)
-            J = self.J(mvec_old)
-            if update_Wsen:
-                self.update_Ws(J)            
-            g = J.T @ self.Wd.T@ rd
-            H = J.T @ self.Wd.T@ self.Wd@J
-            if m_ref is not None:
-                g += beta * self.alphas * (self.Ws.T@self.Ws@ (mvec_old - m_ref))
-                H += beta * self.alphas * self.Ws.T@self.Ws
-            if self.Wx is not None:
-                g += beta * self.alphax * (
-                    self.Wx.T @ self.Wx @ mvec_old)
-                H += beta * self.alphax * self.Wx.T @ self.Wx
+ 
+            # beta = beta0 / (coolingFactor ** (i // coolingRate))
+            f, phid, phim, dpred_old, g, H = self.loss_func_L2(
+                mvec_old, beta, m_ref=m_ref, gradient=True,
+                update_Wsen=update_Wsen
+                )
 
             dm = np.linalg.solve(H, g)  # Ensure dm is a 1D tensor
             g_norm = np.linalg.norm(g, ord=2)
@@ -3105,26 +3182,139 @@ class Optimization:  # Inherits from BaseSimulation
                 break
             s = s0
             mvec_new = self.project_convex_set(mvec_old - s * dm)
-            f_new, phid, phim = self.loss_func(mvec_new,beta, m_ref=m_ref)# phid
+            f_new, phid, phim, dpred_new = self.loss_func_L2(mvec_new,beta, m_ref=m_ref)# phid
             directional_derivative = np.dot(g.flatten(), -dm.flatten())
             while f_new >= f_old + s * mu * directional_derivative:
                 s *= sfac
                 mvec_new = self.project_convex_set(mvec_old - s * dm)
-                f_new, phid, phim = self.loss_func(mvec_new,beta,m_ref=m_ref) #phid
+                f_new, phid, phim, dpred_new = self.loss_func_L2(mvec_new,beta,m_ref=m_ref) #phid
                 if s < stol:
                     break
             mvec_old = mvec_new
             f_old = f_new
+            dpred_old = dpred_new
             if print_update:
                 print(f'{i+1:3}, beta:{beta:.1e}, step:{s:.1e}, g:{g_norm:.1e}, phid:{phid:.1e}, phim:{phim:.1e}, f:{f_new:.1e} ')
 
         self.error_prg.append([f_new, phid, phim])
         self.mvec_prg.append(mvec_new)
-        self.data_prg.append(self.dpred(mvec_new))
-        self.betas.append(beta)
-
+        self.data_prg.append(dpred_new)
+        # self.betas.append(beta)
         return mvec_new
 
+    def set_beta_GMM_schedule(self, niter, beta0_GMM, heatingRate=2, heatingFactor=2):
+        betas_GMM_list = []
+        for i in range(niter):
+            betas_GMM_list.append(beta0_GMM * (heatingRate ** (i // heatingFactor)))
+        self.niter, self.betas_GMM_list = niter, betas_GMM_list
+
+    def set_GMM_parameters(self, weights, means, covariances, gamma):
+        self.weights = weights
+        self.means = means
+        self.covariances = covariances
+        self.gamma = gamma
+
+    def loss_func_GMM_single_feature(
+        self,
+        m,
+        beta_GMM,
+        gradient=False,
+        ):
+        # Data misfit
+        dpred_m = self.dpred(m)
+        rd = self.Wd @ (dpred_m - self.dobs)
+        phid = 0.5 * np.dot(rd, rd)
+        # GMM regularization
+        K = len(self.weights)
+        N = len(m)
+        phim_GMM = 0.0
+
+        if gradient:
+            J = self.J(m)
+            g_data = J.T @ self.Wd.T @ rd
+            H_data = J.T @ self.Wd.T @ self.Wd @ J
+            g_gmm = np.zeros(N)
+            Hdiag_gmm = np.zeros(N)
+
+        for k in range(K):
+            # scalar mean and variance
+            mu_k = self.means[k, 0]
+            var_k = self.covariances[k, 0, 0]
+            diff = m - mu_k
+            # objective
+            phim_GMM += 0.5 * np.sum(self.gamma[:, k]* diff**2/ var_k)
+
+            if gradient:
+                # gradient
+                g_gmm += self.gamma[:, k] * diff / var_k
+                # approximate Hessian diagonal
+                Hdiag_gmm += self.gamma[:, k]/ var_k
+        f = phid + beta_GMM * phim_GMM
+        if gradient:
+            H_gmm = np.diag(Hdiag_gmm)
+            g = g_data + beta_GMM * g_gmm
+            H = H_data + beta_GMM * H_gmm
+            return f, phid, phim_GMM, dpred_m, g, H
+
+        else:
+            return f, phid, phim_GMM, dpred_m
+
+    def GN_GMM_reg_signle_feature(self,mvec_init,
+                print_update=True, s0=1.0, sfac=0.5,
+        stol=1e-6, gtol=1e-3, mu=1e-4):
+        self.error_prg = []
+        self.data_prg = []
+        self.mvec_prg = []
+
+        mvec_old = mvec_init.copy()
+        m_ref = mvec_init
+        # beta= beta0
+        beta_GMM = self.betas_GMM_list[0]
+        f_old, phid, phim, _ = self.loss_func_GMM_single_feature(
+                mvec_old,beta_GMM, gradient=False)
+        
+        for i in range(self.niter):
+            dpred_old = self.dpred(mvec_old)
+            beta_GMM = self.betas_GMM_list[i]
+            # self.betas.append(beta)
+            self.error_prg.append([f_old, phid, phim])
+            self.mvec_prg.append(mvec_old)
+            self.data_prg.append(dpred_old)
+
+            # beta = beta0 / (coolingFactor ** (i // coolingRate))        
+            f, phid, phim, dpred_m, g, H = self.loss_func_GMM_single_feature(
+                mvec_old,beta_GMM, gradient=True
+                )
+
+            dm = np.linalg.solve(H, g)  # Ensure dm is a 1D tensor
+            g_norm = np.linalg.norm(g, ord=2)
+
+            if g_norm < gtol:
+                print(f"Inversion complete since norm of gradient is small as: {g_norm:.3e}")
+                break
+            s = s0
+            mvec_new = self.project_convex_set(mvec_old - s * dm)
+            f_new, phid, phim, _ = self.loss_func_GMM_single_feature(
+                m= mvec_new,beta_GMM=beta_GMM, gradient=False) #phid
+            directional_derivative = np.dot(g.flatten(), -dm.flatten())
+            while f_new >= f_old + s * mu * directional_derivative:
+                s *= sfac
+                mvec_new = self.project_convex_set(mvec_old - s * dm)
+                f_new, phid, phim, _ = self.loss_func_GMM_single_feature(
+                    m= mvec_new,beta_GMM=beta_GMM, gradient=False) #phid
+                if s < stol:
+                    break
+            mvec_old = mvec_new
+            f_old = f_new
+
+            if print_update:
+                print(f'{i+1:3}, beta:{beta_GMM:.1e}, step:{s:.1e}, g:{g_norm:.1e}, phid:{phid:.1e}, phim:{phim:.1e}, f:{f_new:.1e} ')
+
+        self.error_prg.append([f_new, phid, phim])
+        self.mvec_prg.append(mvec_new)
+        self.data_prg.append(self.dpred(mvec_new))
+        # self.betas.append(beta)
+        return mvec_new
 
 class InducedPolarization:
 
@@ -3845,6 +4035,105 @@ class PsuedoLog:
         default_kwargs.update(kwargs)
         ax.axhline(self.pl_value(y, logmin=logmin,linScale=linScale), **default_kwargs)
         return ax
+
+def gaussian_logpdf(x, mean, cov):
+    """
+    Log probability of multivariate Gaussian.
+
+    x    : (N, D)
+    mean : (D,)
+    cov  : (D, D)
+    """
+
+    diff = x - mean
+
+    sign, logdet = np.linalg.slogdet(cov)
+
+    if sign <= 0:
+        raise ValueError("Covariance matrix must be positive definite.")
+
+    # Do not explicitly calculate inverse
+    tmp = np.linalg.solve(cov, diff.T).T
+
+    mahal = np.sum(diff * tmp, axis=1)
+
+    D = x.shape[1]
+
+    return -0.5 * (
+        D * np.log(2.0 * np.pi)
+        + logdet
+        + mahal
+    )
+
+def gmm_e_step(x, weights, means, covariances):
+    """
+    Calculate responsibility gamma_ik.
+
+    x           : (N, D)
+    weights     : (K,)
+    means       : (K, D)
+    covariances : (K, D, D)
+    """
+
+    N = x.shape[0]
+    K = len(weights)
+
+    log_prob = np.zeros((N, K))
+
+    for k in range(K):
+
+        log_prob[:, k] = (
+            np.log(weights[k])
+            + gaussian_logpdf(
+                x,
+                means[k],
+                covariances[k]
+            )
+        )
+
+    # log p(x_i)
+    log_norm = logsumexp(
+        log_prob,
+        axis=1,
+        keepdims=True
+    )
+
+    # responsibility
+    gamma = np.exp(log_prob - log_norm)
+    return gamma
+
+def gmm_m_step(x, gamma, reg_covar=1e-6):
+
+    N, D = x.shape
+    K = gamma.shape[1]
+
+    Nk = np.sum(gamma, axis=0)
+
+    weights = Nk / N
+
+    means = np.zeros((K, D))
+    covariances = np.zeros((K, D, D))
+
+    for k in range(K):
+
+        # mean
+        means[k] = (
+            gamma[:, k, None] * x
+        ).sum(axis=0) / Nk[k]
+
+        # covariance
+        diff = x - means[k]
+
+        covariances[k] = (
+            (gamma[:, k, None] * diff).T
+            @ diff
+        ) / Nk[k]
+
+        # Prevent singular covariance
+        covariances[k] += (
+            reg_covar * np.eye(D)
+        )
+    return weights, means, covariances    
 
 def solve_polynomial(a, n,pmax):
     # Coefficients of the polynomial -x^{n+1} + (1+a)x - a = 0
